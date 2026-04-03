@@ -1,0 +1,133 @@
+import time
+import math
+import krpc
+
+
+def fmt3(v):
+    return f"({v[0]: .3f}, {v[1]: .3f}, {v[2]: .3f})"
+
+
+def fmt4(q):
+    return f"({q[0]: .4f}, {q[1]: .4f}, {q[2]: .4f}, {q[3]: .4f})"
+
+
+def rfd_to_frd(v_rfd):
+    # kRPC vessel.reference_frame: x=Right, y=Forward, z=Down
+    x_r, y_f, z_d = v_rfd
+    return (y_f, x_r, z_d)
+
+
+def une_to_ned(v_une):
+    # kRPC surface_reference_frame: x=Up, y=North, z=East
+    x_u, y_n, z_e = v_une
+    return (y_n, z_e, -x_u)
+
+
+def clear_screen():
+    print("\n" * 3)
+
+
+def main():
+    conn = krpc.connect(name="Quadcopter Frame Reader")
+    sc = conn.space_center
+    vessel = sc.active_vessel
+    body = vessel.orbit.body
+
+    # 参考系
+    vessel_rf = vessel.reference_frame                 # body-fixed: RFD
+    surface_rf = vessel.surface_reference_frame        # local: UNE
+    surface_vel_rf = vessel.surface_velocity_reference_frame
+    orbital_rf = vessel.orbital_reference_frame
+    body_rf = body.reference_frame                     # body-centered rotating frame
+
+    # Flight 对象
+    flight_default = vessel.flight()                   # 读经纬高、pitch/heading/roll 很方便
+    flight_surface = vessel.flight(surface_rf)
+
+    print(f"Connected to vessel: {vessel.name}")
+    print(f"Body: {body.name}")
+    print("Reading coordinate data... Ctrl+C to stop.")
+    time.sleep(1)
+
+    while True:
+        clear_screen()
+
+        # -------- 绝对地理信息 --------
+        lat = flight_default.latitude
+        lon = flight_default.longitude
+        mean_alt = flight_default.mean_altitude
+        surf_alt = flight_default.surface_altitude
+
+        # 用天体参考系拿“绝对位置”
+        pos_body = vessel.position(body_rf)
+
+        # -------- 姿态相关 --------
+        # 在地表系下的朝向
+        rot_surface = vessel.rotation(surface_rf)      # quaternion (x, y, z, w)
+        dir_surface = vessel.direction(surface_rf)     # unit vector, in UNE
+        dir_ned = une_to_ned(dir_surface)
+
+        # KSP / kRPC 直接给的姿态角
+        pitch = flight_default.pitch
+        heading = flight_default.heading
+        roll = flight_default.roll
+
+        # -------- 速度相关 --------
+        vel_surface = vessel.velocity(surface_rf)      # UNE
+        vel_ned = une_to_ned(vel_surface)
+
+        # -------- 角速度相关 --------
+        # 在机体系里读最适合控制，但注意这是 RFD，不是常见 FRD
+        ang_vel_body_rfd = vessel.angular_velocity(vessel_rf)
+        ang_vel_body_frd = rfd_to_frd(ang_vel_body_rfd)
+
+        # -------- 轨道系下看看，帮助你核对 --------
+        dir_orb = vessel.direction(orbital_rf)
+        ang_vel_orb = vessel.angular_velocity(orbital_rf)
+
+        print("=" * 72)
+        print("GLOBAL / GEOGRAPHIC")
+        print("=" * 72)
+        print(f"Lat, Lon               : ({lat:.6f}, {lon:.6f}) deg")
+        print(f"Mean altitude          : {mean_alt:.3f} m")
+        print(f"Surface altitude       : {surf_alt:.3f} m")
+        print(f"Position in body frame : {fmt3(pos_body)}  [body.reference_frame]")
+
+        print("\n" + "=" * 72)
+        print("ATTITUDE")
+        print("=" * 72)
+        print(f"Pitch / Heading / Roll : ({pitch: .3f}, {heading: .3f}, {roll: .3f}) deg")
+        print(f"Rotation in surface RF : {fmt4(rot_surface)}  [quaternion]")
+        print(f"Direction in surface RF: {fmt3(dir_surface)}  [UNE raw]")
+        print(f"Direction in Local NED : {fmt3(dir_ned)}      [converted]")
+
+        print("\n" + "=" * 72)
+        print("VELOCITY")
+        print("=" * 72)
+        print(f"Velocity in surface RF : {fmt3(vel_surface)}  [UNE raw]")
+        print(f"Velocity in Local NED  : {fmt3(vel_ned)}      [converted]")
+        print(f"Surface speed          : {flight_surface.speed:.3f} m/s")
+        print(f"Horizontal speed       : {flight_surface.horizontal_speed:.3f} m/s")
+        print(f"Vertical speed         : {flight_surface.vertical_speed:.3f} m/s")
+
+        print("\n" + "=" * 72)
+        print("BODY RATES")
+        print("=" * 72)
+        print(f"Angular vel in body RF : {fmt3(ang_vel_body_rfd)}  [RFD raw]")
+        print(f"Angular vel in Body FRD: {fmt3(ang_vel_body_frd)}  [converted]")
+        print("FRD order means: (forward-axis rate, right-axis rate, down-axis rate)")
+
+        print("\n" + "=" * 72)
+        print("ORBITAL FRAME CHECK")
+        print("=" * 72)
+        print(f"Direction in orbital RF: {fmt3(dir_orb)}")
+        print(f"Angular vel in orbital : {fmt3(ang_vel_orb)}")
+
+        time.sleep(0.2)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped by user.")

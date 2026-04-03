@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+from Control_loop_test_v1.control.controller import RollPitchRatePController
+from Control_loop_test_v1.control.mixer import MatrixMixer
+from Control_loop_test_v1.control.mixer_presets import get_candidate, list_candidates
+from Control_loop_test_v1.data_api.krpc_bindings import KrpcQuadHardware
+from Control_loop_test_v1.data_api.models import MotorCommand, RollRateTestCommand, RollRateTestState
+from Control_loop_test_v1.data_api.telemetry import RollRateTelemetryReader
+
+
+class RollRateInnerLoopRuntime:
+    """Orchestrate one narrow roll/pitch inner-loop test step."""
+
+    def __init__(self) -> None:
+        self.hardware = KrpcQuadHardware()
+        self.telemetry = RollRateTelemetryReader(self.hardware)
+        self.controller = RollPitchRatePController()
+        self.mixer = MatrixMixer()
+        self.command = RollRateTestCommand(
+            base_rpm=0.0,
+            p_cmd_rad_s=0.0,
+            q_cmd_rad_s=0.0,
+            kp_p=0.0,
+            kp_q=0.0,
+            output_limit=0.0,
+        )
+        self.current_mixer = get_candidate(list_candidates()[0])
+        self.test_running = False
+        self.last_snapshot = RollRateTestState(
+            mixer_name=self.current_mixer.name,
+            mixer_matrix_text=self.mixer.format_matrix_text(self.current_mixer),
+        )
+
+    def connect(self) -> None:
+        self.hardware.connect()
+        self.telemetry.connect()
+        self._refresh_snapshot(status="Connected")
+
+    def disconnect(self) -> None:
+        self.test_running = False
+        self.telemetry.disconnect()
+        self.hardware.disconnect()
+        self._refresh_snapshot(status="Disconnected")
+
+    def bind(self) -> None:
+        self.hardware.bind()
+        self._refresh_snapshot(status="Bound exact controller and rotor tags")
+
+    def initialize(self) -> None:
+        self.hardware.initialize()
+        self._refresh_snapshot(status="Initialized rotors and KAL controllers")
+
+    def start_test(self) -> None:
+        if not self.hardware.is_bound():
+            raise RuntimeError("Bind tags before starting the test loop.")
+        if not self.hardware.initialized:
+            raise RuntimeError("Initialize hardware before starting the test loop.")
+        self.test_running = True
+        self._refresh_snapshot(status="Test loop started")
+
+    def stop_test(self) -> None:
+        self.test_running = False
+        if self.hardware.is_bound():
+            self.hardware.zero_outputs()
+        self._refresh_snapshot(status="Test loop stopped")
+
+    def emergency_stop(self) -> None:
+        self.test_running = False
+        self.hardware.emergency_stop()
+        self._refresh_snapshot(status="Emergency stop issued")
+
+    def set_command(self, command: RollRateTestCommand) -> None:
+        self.command = command
+        self._refresh_snapshot(status="Parameters updated")
+
+    def set_mixer_candidate(self, name: str) -> None:
+        self.current_mixer = get_candidate(name)
+        self._refresh_snapshot(status=f"Mixer candidate set to {name}")
+
+    def get_mixer_names(self) -> list[str]:
+        return list_candidates()
+
+    def step(self) -> RollRateTestState:
+        telemetry = self.telemetry.read()
+        controller_result = self.controller.compute(
+            p_cmd_rad_s=self.command.p_cmd_rad_s,
+            q_cmd_rad_s=self.command.q_cmd_rad_s,
+            p_meas_rad_s=telemetry.p_meas_rad_s,
+            q_meas_rad_s=telemetry.q_meas_rad_s,
+            kp_p=self.command.kp_p,
+            kp_q=self.command.kp_q,
+            output_limit=self.command.output_limit,
+        )
+        motor_command = self.mixer.mix(
+            candidate=self.current_mixer,
+            base_rpm=self.command.base_rpm,
+            u_roll=controller_result.u_roll,
+            u_pitch=controller_result.u_pitch,
+        )
+        self.hardware.write_motor_command(motor_command)
+        return self._refresh_snapshot(
+            telemetry=telemetry,
+            controller=controller_result,
+            motor_command=motor_command,
+            status="Step executed",
+        )
+
+    def get_snapshot(self) -> RollRateTestState:
+        return self.last_snapshot
+
+    def _refresh_snapshot(
+        self,
+        *,
+        telemetry=None,
+        controller=None,
+        motor_command: MotorCommand | None = None,
+        status: str = "Idle",
+        last_error: str = "",
+    ) -> RollRateTestState:
+        telemetry_value = telemetry if telemetry is not None else self.last_snapshot.telemetry
+        controller_value = controller if controller is not None else self.last_snapshot.controller
+        motor_value = motor_command if motor_command is not None else self.last_snapshot.motor_command
+        binding = self.hardware.get_binding_status(test_running=self.test_running)
+        self.last_snapshot = RollRateTestState(
+            binding=binding,
+            command=self.command,
+            telemetry=telemetry_value,
+            controller=controller_value,
+            motor_command=motor_value,
+            mixer_name=self.current_mixer.name,
+            mixer_matrix_text=self.mixer.format_matrix_text(self.current_mixer),
+            controller_tags_bound=dict(binding.controller_tags),
+            rotor_tags_bound=dict(binding.rotor_tags),
+            last_error=last_error,
+            last_status=status,
+        )
+        return self.last_snapshot

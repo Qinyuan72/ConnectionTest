@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import math
+import time
+from typing import Any
+
+from Control_loop_test_v1.data_api.krpc_bindings import KrpcQuadHardware
+from Control_loop_test_v1.data_api.models import RollRateTelemetry
+
+
+class RollRateTelemetryReader:
+    """Read only the telemetry needed for single-axis roll-rate inner-loop testing."""
+
+    def __init__(self, hardware: KrpcQuadHardware) -> None:
+        self.hardware = hardware
+        self.streams: dict[str, Any] = {}
+        self._last_timestamp_s: float | None = None
+
+    def connect(self) -> None:
+        if self.streams:
+            return
+        if not self.hardware.is_connected():
+            raise RuntimeError("Telemetry reader requires an active kRPC connection.")
+
+        assert self.hardware.conn is not None
+        assert self.hardware.vessel is not None
+        assert self.hardware.body is not None
+
+        vessel = self.hardware.vessel
+        body = self.hardware.body
+        conn = self.hardware.conn
+
+        vessel_rf = vessel.reference_frame
+        body_rf = body.reference_frame
+
+        # Keep vessel axes while measuring angular velocity relative to the body frame.
+        body_axes_surface_rate_rf = conn.space_center.ReferenceFrame.create_hybrid(
+            position=vessel_rf,
+            rotation=vessel_rf,
+            velocity=body_rf,
+            angular_velocity=body_rf,
+        )
+
+        flight_default = vessel.flight()
+        self.streams = {
+            "roll_deg": conn.add_stream(getattr, flight_default, "roll"),
+            "pitch_deg": conn.add_stream(getattr, flight_default, "pitch"),
+            "heading_deg": conn.add_stream(getattr, flight_default, "heading"),
+            "body_rates_rfd_rad_s": conn.add_stream(vessel.angular_velocity, body_axes_surface_rate_rf),
+        }
+
+    def disconnect(self) -> None:
+        for stream in self.streams.values():
+            try:
+                stream.remove()
+            except Exception:
+                pass
+        self.streams.clear()
+        self._last_timestamp_s = None
+
+    def read(self) -> RollRateTelemetry:
+        if not self.streams:
+            raise RuntimeError("Telemetry reader is not initialized.")
+
+        timestamp_s = time.monotonic()
+        body_rates_rfd = self._sanitize_vector(tuple(self.streams["body_rates_rfd_rad_s"]()))
+        body_rates_frd = self._rfd_to_frd(body_rates_rfd)
+        roll_deg = self._sanitize_scalar(float(self.streams["roll_deg"]()))
+        pitch_deg = self._sanitize_scalar(float(self.streams["pitch_deg"]()))
+        heading_deg = self._sanitize_scalar(float(self.streams["heading_deg"]()))
+        dt_s = self._compute_dt(timestamp_s)
+        roll_rate_deg_s, pitch_rate_deg_s, yaw_rate_deg_s = self._derive_euler_rates(
+            roll_deg=roll_deg,
+            pitch_deg=pitch_deg,
+            body_rates_frd_rad_s=body_rates_frd,
+        )
+
+        return RollRateTelemetry(
+            p_meas_rad_s=body_rates_frd[0],
+            q_meas_rad_s=body_rates_frd[1],
+            r_meas_rad_s=body_rates_frd[2],
+            roll_deg=roll_deg,
+            pitch_deg=pitch_deg,
+            heading_deg=heading_deg,
+            roll_rate_deg_s=roll_rate_deg_s,
+            pitch_rate_deg_s=pitch_rate_deg_s,
+            yaw_rate_deg_s=yaw_rate_deg_s,
+            body_rates_rfd_rad_s=body_rates_rfd,
+            body_rates_frd_rad_s=body_rates_frd,
+            timestamp_s=timestamp_s,
+            dt_s=dt_s,
+        )
+
+    def _compute_dt(self, timestamp_s: float) -> float:
+        if self._last_timestamp_s is None:
+            self._last_timestamp_s = timestamp_s
+            return 0.0
+        dt_s = timestamp_s - self._last_timestamp_s
+        self._last_timestamp_s = timestamp_s
+        if not math.isfinite(dt_s) or dt_s < 0.0:
+            return 0.0
+        return dt_s
+
+    def _derive_euler_rates(
+        self,
+        *,
+        roll_deg: float,
+        pitch_deg: float,
+        body_rates_frd_rad_s: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        """Estimate Euler angle rates from FRD body rates for display/analysis."""
+
+        phi = math.radians(roll_deg)
+        theta = math.radians(pitch_deg)
+        p_rate, q_rate, r_rate = body_rates_frd_rad_s
+
+        cos_theta = math.cos(theta)
+        if abs(cos_theta) < 1e-6:
+            return (0.0, 0.0, 0.0)
+
+        roll_rate = p_rate + math.sin(phi) * math.tan(theta) * q_rate + math.cos(phi) * math.tan(theta) * r_rate
+        pitch_rate = math.cos(phi) * q_rate - math.sin(phi) * r_rate
+        yaw_rate = (math.sin(phi) / cos_theta) * q_rate + (math.cos(phi) / cos_theta) * r_rate
+        return (
+            math.degrees(roll_rate),
+            math.degrees(pitch_rate),
+            math.degrees(yaw_rate),
+        )
+
+    def _rfd_to_frd(self, vector: tuple[float, float, float]) -> tuple[float, float, float]:
+        right, forward, down = vector
+        return (forward, right, down)
+
+    def _sanitize_scalar(self, value: float) -> float:
+        if not math.isfinite(value):
+            return 0.0
+        return value
+
+    def _sanitize_vector(self, vector: tuple[float, float, float]) -> tuple[float, float, float]:
+        return tuple(self._sanitize_scalar(component) for component in vector)
